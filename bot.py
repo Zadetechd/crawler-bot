@@ -2,6 +2,7 @@ import os
 import requests # For making HTTP requests to APIs
 import logging # For seeing what the bot is doing
 import asyncio # For the set_webhook call if done programmatically
+import tracemalloc # For tracing memory allocations and getting more context on certain warnings
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -12,12 +13,15 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 XMR_WALLET_ADDRESS = os.environ.get("XMR_WALLET_ADDRESS")
 EXCHANGERATE_API_KEY = os.environ.get("EXCHANGERATE_API_KEY")
 
-# --- NEW Webhook Specific Configuration ---
+# --- Webhook Specific Configuration ---
 # The port your web server will listen on. Hosting platforms usually set this.
 PORT = int(os.environ.get("PORT", "8080")) # Default to 8080 if not set
 # The public domain name your bot is accessible at (e.g., "your-bot.onrender.com")
 # Do NOT include https:// or the path here.
 WEBHOOK_DOMAIN = os.environ.get("WEBHOOK_DOMAIN")
+
+# --- Enable tracemalloc (as early as possible) ---
+tracemalloc.start()
 
 
 # --- Logging Setup ---
@@ -31,7 +35,7 @@ logging.getLogger("telegram.vendor.ptb_urllib3.urllib3.connectionpool").setLevel
 
 logger = logging.getLogger(__name__)
 
-# --- Helper Functions to Get Data (These remain unchanged) ---
+# --- Helper Functions to Get Data ---
 
 def get_xmr_pool_stats(wallet_address):
     """Fetches mining stats from SupportXMR pool."""
@@ -52,7 +56,7 @@ def get_xmr_pool_stats(wallet_address):
     except requests.RequestException as e:
         logger.error(f"Error fetching pool stats: {e}")
         return None
-    except (KeyError, ValueError, TypeError) as e:
+    except (KeyError, ValueError, TypeError) as e: # Added TypeError
         logger.error(f"Error parsing pool stats data: {e} - Data: {response.text if 'response' in locals() else 'N/A'}")
         return None
 
@@ -73,7 +77,7 @@ def get_xmr_to_usd_price():
 
 def get_usd_to_ghs_rate(api_key):
     """Fetches USD to GHS exchange rate."""
-    if not api_key or api_key == "YOUR_EXCHANGERATE_API_KEY_HERE": # Check against placeholder
+    if not api_key or api_key == "YOUR_EXCHANGERATE_API_KEY_HERE":
         logger.warning("ExchangeRate API key not configured or is placeholder.")
         return None
     url = f"https://v6.exchangerate-api.com/v6/{api_key}/latest/USD"
@@ -89,14 +93,13 @@ def get_usd_to_ghs_rate(api_key):
         logger.error(f"Error parsing GHS exchange rate data: {e}")
         return None
 
-# --- Telegram Command Handler (This remains unchanged) ---
+# --- Telegram Command Handler ---
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends mining stats when the /stats command is issued."""
     chat_id = update.effective_chat.id
     logger.info(f"Received /stats command from chat_id: {chat_id}")
 
-    # Send an initial "processing" message
     processing_message = await context.bot.send_message(chat_id=chat_id, text="Fetching your Monero mining stats, please wait...")
 
     pool_stats = get_xmr_pool_stats(XMR_WALLET_ADDRESS)
@@ -135,7 +138,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     message_parts.append("Data from SupportXMR & CoinGecko.")
 
     final_message = "\n".join(message_parts)
-    # Edit the "processing" message with the final stats
     await context.bot.edit_message_text(
         chat_id=chat_id,
         message_id=processing_message.message_id,
@@ -143,26 +145,23 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         parse_mode='Markdown'
     )
 
-# --- NEW: Function to set the webhook (optional, can be run once) ---
+# --- Function to set the webhook ---
 async def set_bot_webhook(application: Application, webhook_full_url: str):
     """Sets the bot's webhook with Telegram."""
     logger.info(f"Attempting to set webhook to: {webhook_full_url}")
     try:
         await application.bot.set_webhook(url=webhook_full_url, allowed_updates=Update.ALL_TYPES)
         logger.info(f"Webhook successfully set to {webhook_full_url}")
-        # You might want to verify it
         webhook_info = await application.bot.get_webhook_info()
         logger.info(f"Current webhook info: {webhook_info}")
         if webhook_info.url != webhook_full_url:
             logger.warning(f"Webhook URL mismatch! Expected {webhook_full_url}, got {webhook_info.url}")
-
     except Exception as e:
-        logger.error(f"Error setting webhook: {e}")
+        logger.error(f"Error setting webhook: {e}", exc_info=True) # Added exc_info for more detail
 
-# --- Main Bot Setup (Modified for Webhook) ---
+# --- Main Bot Setup ---
 async def main() -> None:
     """Start the bot with webhooks."""
-    # Critical configuration checks
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("FATAL: Telegram Bot Token (TELEGRAM_BOT_TOKEN) is not configured!")
         return
@@ -172,59 +171,72 @@ async def main() -> None:
     if not WEBHOOK_DOMAIN:
         logger.critical("FATAL: Webhook domain (WEBHOOK_DOMAIN) is not configured! This is needed to construct the webhook URL.")
         return
-
-    # Optional: Check for ExchangeRate API Key
     if not EXCHANGERATE_API_KEY or EXCHANGERATE_API_KEY == "YOUR_EXCHANGERATE_API_KEY_HERE":
         logger.warning("ExchangeRate API Key (EXCHANGERATE_API_KEY) is not configured or is placeholder. GHS conversion will not be available.")
 
-    # The `url_path` is a unique part of your webhook URL.
-    # Using the bot token itself is a common and simple way to make it unique.
-    # IMPORTANT: Ensure this token is not easily guessable if used as a public path.
-    # For better security, you might use a long random string as url_path and
-    # pass it as another environment variable.
-    url_path = TELEGRAM_BOT_TOKEN # Or some other secret path
-
-    # Construct the full webhook URL
-    # Ensure WEBHOOK_DOMAIN does not have a trailing slash
+    url_path = TELEGRAM_BOT_TOKEN
     webhook_full_url = f"https://{WEBHOOK_DOMAIN.rstrip('/')}/{url_path}"
 
-    # Create the Application and pass it your bot's token.
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # Add your command handlers
     application.add_handler(CommandHandler("stats", stats_command))
 
-    # --- Webhook Setup ---
-    # This part sets the webhook with Telegram.
-    # It's often best to do this ONCE when you deploy or if the URL changes.
-    # Some people run this as a separate script or a one-time command.
-    # If run every time the bot starts, ensure it doesn't cause issues.
-    # For many hosting platforms, the bot might restart, so setting it here can be okay.
+    initialized_successfully = False
+    try:
+        logger.info("Attempting to initialize Telegram application...")
+        await application.initialize()  # Explicitly initialize and await
+        initialized_successfully = True
+        logger.info("Telegram application initialized successfully.")
+    except Exception as e:
+        logger.critical(f"CRITICAL: Error during application.initialize(): {e}", exc_info=True)
+        return # Stop if initialization fails
+
+    if not initialized_successfully: # Should not be reached if the above return executes
+        logger.error("Skipping webhook setup and server start due to initialization failure.")
+        return
+
     await set_bot_webhook(application, webhook_full_url)
 
-    logger.info(f"Starting webhook server on port {PORT} with path {url_path}")
-    logger.info(f"Bot will be listening for updates at: {webhook_full_url}")
-
-    # Start the web server.
-    # `listen="0.0.0.0"` makes it listen on all available network interfaces,
-    # which is standard for containerized/cloud environments.
-    # `url_path` is the path component Telegram will send POST requests to.
-    # `webhook_url` is the full URL you've registered with Telegram.
-    # `secret_token` can be used for added security if you configure it on Telegram's side too.
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=url_path, # The path part of your webhook URL (e.g., your bot token)
-        webhook_url=webhook_full_url, # The full URL registered with Telegram
-        # secret_token="YOUR_SUPER_SECRET_TOKEN" # Optional: for added security
-    )
+    try:
+        logger.info(f"Attempting to start webhook server on 0.0.0.0:{PORT} with path /{url_path}")
+        logger.info(f"Bot configured to listen for updates at: {webhook_full_url}")
+        await application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=url_path,
+            webhook_url=webhook_full_url,
+        )
+        logger.info("application.run_webhook has finished (e.g., due to a signal).")
+    except SystemExit:
+        logger.info("SystemExit caught, likely from PTB's signal handling during run_webhook. Preparing to shutdown.")
+        # This allows the finally block to execute for cleanup.
+    except Exception as e:
+        logger.critical(f"CRITICAL: Error during application.run_webhook: {e}", exc_info=True)
+    finally:
+        logger.info("Entering finally block after run_webhook attempt.")
+        # Check if the application was initialized and if it might have been started
+        if initialized_successfully: # Ensure we only try to shutdown an initialized app
+            # hasattr check is good practice before accessing application.running
+            if hasattr(application, 'running') and application.running:
+                logger.info("Application is marked as running, attempting graceful shutdown...")
+            else:
+                # If not 'running', it might have failed before self.start() in run_webhook,
+                # or run_webhook exited cleanly. Still, try shutdown if initialized.
+                logger.info("Application not marked as 'running' but was initialized. Attempting shutdown.")
+            try:
+                await application.shutdown()
+                logger.info("Application shutdown() completed.")
+            except Exception as e_shutdown:
+                logger.error(f"Error during application.shutdown(): {e_shutdown}", exc_info=True)
+        else:
+            logger.info("Application was not initialized successfully; skipping shutdown.")
 
 if __name__ == "__main__":
-    # For asyncio, the entry point needs to be an async function or run through asyncio.run()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user (KeyboardInterrupt)")
+        logger.info("Bot stopped by user (KeyboardInterrupt).")
     except Exception as e:
-        logger.critical(f"Bot crashed with unhandled exception: {e}", exc_info=True)
+        # This catches exceptions that might escape main() if not handled there,
+        # or if asyncio.run() itself has an issue.
+        logger.critical(f"Bot crashed with unhandled exception in top level: {e}", exc_info=True)
 
